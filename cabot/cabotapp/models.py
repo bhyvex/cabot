@@ -1,29 +1,28 @@
-from django.db import models
-from django.conf import settings
-from django.core.exceptions import ValidationError
-from polymorphic import PolymorphicModel
-from django.db.models import F
-from django.core.urlresolvers import reverse
-from django.contrib.auth.models import User
-from celery.exceptions import SoftTimeLimitExceeded
-
-from .jenkins import get_job_status
-from .alert import (send_alert, AlertPlugin, AlertPluginUserData, update_alert_plugins)
-from .calendar import get_events
-from .graphite import parse_metric
-from .graphite import get_data
-from .tasks import update_service, update_instance
-from datetime import datetime, timedelta
-from django.utils import timezone
-
+import itertools
 import json
 import re
-import time
-import os
 import subprocess
+import time
+from datetime import timedelta
 
 import requests
+from celery.exceptions import SoftTimeLimitExceeded
 from celery.utils.log import get_task_logger
+from django.conf import settings
+from django.contrib.auth.models import User
+from django.db import models
+from django.utils import timezone
+from polymorphic import PolymorphicModel
+
+from .alert import (
+    send_alert,
+    send_alert_update,
+    AlertPluginUserData
+)
+from .calendar import get_events
+from .graphite import parse_metric
+from .jenkins import get_job_status
+from .tasks import update_service, update_instance
 
 RAW_DATA_LIMIT = 5000
 
@@ -37,6 +36,7 @@ CHECK_TYPES = (
     ('==', 'Equal to'),
 )
 
+
 def serialize_recent_results(recent_results):
     if not recent_results:
         return ''
@@ -46,6 +46,7 @@ def serialize_recent_results(recent_results):
             return '1'
         else:
             return '-1'
+
     vals = [result_to_value(r) for r in recent_results]
     vals.reverse()
     return ','.join(vals)
@@ -69,7 +70,6 @@ def calculate_debounced_passing(recent_results, debounce=0):
 
 
 class CheckGroupMixin(models.Model):
-
     class Meta:
         abstract = True
 
@@ -134,13 +134,12 @@ class CheckGroupMixin(models.Model):
         null=True,
         blank=True,
         verbose_name='Recovery instructions',
-        help_text='Gist, Hackpad or Refheap js embed with recovery instructions e.g. https://you.hackpad.com/some_document.js'
+        help_text='Gist, Hackpad or Refheap js embed with recovery instructions e.g. '
+                  'https://you.hackpad.com/some_document.js'
     )
-
 
     def __unicode__(self):
         return self.name
-
 
     def most_severe(self, check_list):
         failures = [c.importance for c in check_list]
@@ -168,19 +167,52 @@ class CheckGroupMixin(models.Model):
         if self.overall_status != self.PASSING_STATUS:
             # Don't alert every time
             if self.overall_status == self.WARNING_STATUS:
-                if self.last_alert_sent and (timezone.now() - timedelta(minutes=settings.NOTIFICATION_INTERVAL)) < self.last_alert_sent:
+                if self.last_alert_sent and (
+                    timezone.now() - timedelta(minutes=settings.NOTIFICATION_INTERVAL)) < self.last_alert_sent:
                     return
             elif self.overall_status in (self.CRITICAL_STATUS, self.ERROR_STATUS):
-                if self.last_alert_sent and (timezone.now() - timedelta(minutes=settings.ALERT_INTERVAL)) < self.last_alert_sent:
+                if self.last_alert_sent and (
+                    timezone.now() - timedelta(minutes=settings.ALERT_INTERVAL)) < self.last_alert_sent:
                     return
             self.last_alert_sent = timezone.now()
         else:
             # We don't count "back to normal" as an alert
             self.last_alert_sent = None
         self.save()
-        self.snapshot.did_send_alert = True
-        self.snapshot.save()
-        send_alert(self, duty_officers=get_duty_officers())
+        if self.unexpired_acknowledgement():
+            send_alert_update(self, duty_officers=get_duty_officers())
+        else:
+            self.snapshot.did_send_alert = True
+            self.snapshot.save()
+            send_alert(self, duty_officers=get_duty_officers())
+
+    def unexpired_acknowledgements(self):
+        acknowledgements = self.alertacknowledgement_set.all().filter(
+            time__gte=timezone.now() - timedelta(minutes=settings.ACKNOWLEDGEMENT_EXPIRY),
+            cancelled_time__isnull=True,
+        ).order_by('-time')
+        return acknowledgements
+
+    def acknowledge_alert(self, user):
+        if self.unexpired_acknowledgements():  # Don't allow users to jump on each other
+            return None
+        acknowledgement = AlertAcknowledgement.objects.create(
+            user=user,
+            time=timezone.now(),
+            service=self,
+        )
+
+    def remove_acknowledgement(self, user):
+        self.unexpired_acknowledgements().update(
+            cancelled_time=timezone.now(),
+            cancelled_user=user,
+        )
+
+    def unexpired_acknowledgement(self):
+        try:
+            return self.unexpired_acknowledgements()[0]
+        except:
+            return None
 
     @property
     def recent_snapshots(self):
@@ -221,8 +253,8 @@ class CheckGroupMixin(models.Model):
     def all_failing_checks(self):
         return self.active_status_checks().exclude(calculated_status=self.CALCULATED_PASSING_STATUS)
 
-class Service(CheckGroupMixin):
 
+class Service(CheckGroupMixin):
     def update_status(self):
         self.old_overall_status = self.overall_status
         # Only active checks feed into our calculation
@@ -241,6 +273,7 @@ class Service(CheckGroupMixin):
         self.save()
         if not (self.overall_status == Service.PASSING_STATUS and self.old_overall_status == Service.PASSING_STATUS):
             self.alert()
+
     instances = models.ManyToManyField(
         'Instance',
         blank=True,
@@ -257,8 +290,6 @@ class Service(CheckGroupMixin):
 
 
 class Instance(CheckGroupMixin):
-
-
     def duplicate(self):
         checks = self.status_checks.all()
         new_instance = self
@@ -308,8 +339,8 @@ class Instance(CheckGroupMixin):
         self.icmp_status_checks().delete()
         return super(Instance, self).delete(*args, **kwargs)
 
-class Snapshot(models.Model):
 
+class Snapshot(models.Model):
     class Meta:
         abstract = True
 
@@ -320,11 +351,13 @@ class Snapshot(models.Model):
     overall_status = models.TextField(default=Service.PASSING_STATUS)
     did_send_alert = models.IntegerField(default=False)
 
+
 class ServiceStatusSnapshot(Snapshot):
     service = models.ForeignKey(Service, related_name='snapshots')
 
     def __unicode__(self):
         return u"%s: %s" % (self.service.name, self.overall_status)
+
 
 class InstanceStatusSnapshot(Snapshot):
     instance = models.ForeignKey(Instance, related_name='snapshots')
@@ -332,8 +365,8 @@ class InstanceStatusSnapshot(Snapshot):
     def __unicode__(self):
         return u"%s: %s" % (self.instance.name, self.overall_status)
 
-class StatusCheck(PolymorphicModel):
 
+class StatusCheck(PolymorphicModel):
     """
     Base class for polymorphic models. We're going to use
     proxy models for inheriting because it makes life much simpler,
@@ -354,7 +387,9 @@ class StatusCheck(PolymorphicModel):
         max_length=30,
         choices=Service.IMPORTANCES,
         default=Service.ERROR_STATUS,
-        help_text='Severity level of a failure. Critical alerts are for failures you want to wake you up at 2am, Errors are things you can sleep through but need to fix in the morning, and warnings for less important things.'
+        help_text='Severity level of a failure. Critical alerts are for failures you want to wake you up at 2am, '
+                  'Errors are things you can sleep through but need to fix in the morning, and warnings for less '
+                  'important things.'
     )
     frequency = models.IntegerField(
         default=5,
@@ -363,7 +398,8 @@ class StatusCheck(PolymorphicModel):
     debounce = models.IntegerField(
         default=0,
         null=True,
-        help_text='Number of successive failures permitted before check will be marked as failed. Default is 0, i.e. fail on first failure.'
+        help_text='Number of successive failures permitted before check will be marked as failed. Default is 0, '
+                  'i.e. fail on first failure.'
     )
     created_by = models.ForeignKey(User, null=True)
     calculated_status = models.CharField(
@@ -374,7 +410,8 @@ class StatusCheck(PolymorphicModel):
     # Graphite checks
     metric = models.TextField(
         null=True,
-        help_text='fully.qualified.name of the Graphite metric you want to watch. This can be any valid Graphite expression, including wildcards, multiple hosts, etc.',
+        help_text='fully.qualified.name of the Graphite metric you want to watch. This can be any valid Graphite '
+                  'expression, including wildcards, multiple hosts, etc.',
     )
     check_type = models.CharField(
         choices=CHECK_TYPES,
@@ -390,10 +427,11 @@ class StatusCheck(PolymorphicModel):
         null=True,
         help_text='The minimum number of data series (hosts) you expect to see.',
     )
-    expected_num_metrics = models.IntegerField(
+    allowed_num_failures = models.IntegerField(
         default=0,
         null=True,
-        help_text='The minimum number of data series (metrics) you expect to satisfy given condition.',
+        help_text='The maximum number of data series (metrics) you expect to fail. For example, you might be OK with '
+                  '2 out of 3 webservers having OK load (1 failing), but not 1 out of 3 (2 failing).',
     )
 
     # HTTP checks
@@ -465,7 +503,8 @@ class StatusCheck(PolymorphicModel):
             result.succeeded = False
         except Exception as e:
             result = StatusCheckResult(check=self)
-            result.error = u'Error in performing check: %s' % (e,)
+            logger.error(u"Error performing check: %s" % (e.message,))
+            result.error = u'Error in performing check: %s' % (e.message,)
             result.succeeded = False
         finish = timezone.now()
         result.time = start
@@ -521,8 +560,8 @@ class StatusCheck(PolymorphicModel):
         for instance in instances:
             update_instance.delay(instance.id)
 
-class ICMPStatusCheck(StatusCheck):
 
+class ICMPStatusCheck(StatusCheck):
     class Meta(StatusCheck.Meta):
         proxy = True
 
@@ -535,8 +574,10 @@ class ICMPStatusCheck(StatusCheck):
         instances = self.instance_set.all()
         target = self.instance_set.get().address
 
-        # We need to read both STDOUT and STDERR because ping can write to both, depending on the kind of error. Thanks a lot, ping.
-        ping_process = subprocess.Popen("ping -c 1 " + target, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
+        # We need to read both STDOUT and STDERR because ping can write to both, depending on the kind of error.
+        # Thanks a lot, ping.
+        ping_process = subprocess.Popen("ping -c 1 " + target, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        shell=True)
         response = ping_process.wait()
 
         if response == 0:
@@ -549,8 +590,28 @@ class ICMPStatusCheck(StatusCheck):
         return result
 
 
-class GraphiteStatusCheck(StatusCheck):
+def minimize_targets(targets):
+    split = [target.split(".") for target in targets]
 
+    prefix_nodes_in_common = 0
+    for i, nodes in enumerate(itertools.izip(*split)):
+        if any(node != nodes[0] for node in nodes):
+            prefix_nodes_in_common = i
+            break
+    split = [nodes[prefix_nodes_in_common:] for nodes in split]
+
+    suffix_nodes_in_common = 0
+    for i, nodes in enumerate(reversed(zip(*split))):
+        if any(node != nodes[0] for node in nodes):
+            suffix_nodes_in_common = i
+            break
+    if suffix_nodes_in_common:
+        split = [nodes[:-suffix_nodes_in_common] for nodes in split]
+
+    return [".".join(nodes) for nodes in split]
+
+
+class GraphiteStatusCheck(StatusCheck):
     class Meta(StatusCheck.Meta):
         proxy = True
 
@@ -558,130 +619,86 @@ class GraphiteStatusCheck(StatusCheck):
     def check_category(self):
         return "Metric check"
 
-    def format_error_message(self, failure_value, actual_hosts, actual_metrics):
-        """
-        A summary of why the check is failing for inclusion in short alert messages
-        Returns something like:
-        "5.0 > 4 | 1/2 hosts"
-        """
-        hosts_string = u''
-        if self.expected_num_hosts > 0:
-            hosts_string = u' | %s/%s hosts' % (actual_hosts,
-                                                self.expected_num_hosts)
-            if self.expected_num_hosts > actual_hosts:
-                return u'Hosts missing%s' % hosts_string
-        if self.expected_num_metrics > 0:
-            metrics_string = u' | %s/%s metrics' % (actual_metrics,
-                                                self.expected_num_metrics)
-            if self.expected_num_metrics > actual_metrics:
-                return u'Metrics satisfying condition missing%s' % metrics_string
-        if failure_value is None:
-            return "Failed to get metric from Graphite"
-        return u"%0.1f %s %0.1f%s" % (
-            failure_value,
-            self.check_type,
-            float(self.value),
-            hosts_string
-        )
+    def format_error_message(self, failures, actual_hosts, hosts_by_target):
+        if actual_hosts < self.expected_num_hosts:
+            return "Hosts missing | %d/%d hosts" % (
+                actual_hosts, self.expected_num_hosts)
+        elif actual_hosts > 1:
+            threshold = float(self.value)
+            failures_by_host = ["%s: %s %s %0.1f" % (
+                hosts_by_target[target], value, self.check_type, threshold)
+                                for target, value in failures]
+            return ", ".join(failures_by_host)
+        else:
+            target, value = failures[0]
+            return "%s %s %0.1f" % (value, self.check_type, float(self.value))
 
     def _run(self):
-        series = parse_metric(self.metric, mins_to_check=self.frequency)
-        failure_value = None
-        if series['error']:
-            failed = True
-        else:
-            failed = None
+        result = StatusCheckResult(check=self)
 
-        result = StatusCheckResult(
-            check=self,
-        )
-        if series['num_series_with_data'] > 0:
-            result.average_value = series['average_value']
-            if self.check_type == '<':
-                failed = float(series['min']) < float(self.value)
-                if failed:
-                    failure_value = series['min']
-            elif self.check_type == '<=':
-                failed = float(series['min']) <= float(self.value)
-                if failed:
-                    failure_value = series['min']
-            elif self.check_type == '>':
-                failed = float(series['max']) > float(self.value)
-                if failed:
-                    failure_value = series['max']
-            elif self.check_type == '>=':
-                failed = float(series['max']) >= float(self.value)
-                if failed:
-                    failure_value = series['max']
-            elif self.check_type == '==':
-                failed = float(self.value) in series['all_values']
-                if failed:
-                    failure_value = float(self.value)
-            else:
-                raise Exception(u'Check type %s not supported' %
-                                self.check_type)
-
-        if series['num_series_with_data'] < self.expected_num_hosts:
-            failed = True
-
-        matched_metrics = 0
-        if self.expected_num_metrics > 0:
-            metric_failed = True
-            json_series = get_data(self.metric)
-#            json_series = json.dumps(series['raw'])
-            logger.info("Processing series " + str(json_series))
-            for line in json_series:
-                last_value = line['datapoints'][-self.frequency][0]
-#                logger.error("Processing value " + str(last_value) + " Should be " + self.check_type + self.value)
-                if last_value is not None:
-                    if self.check_type == '<':
-                        metric_failed = not last_value < float(self.value)
-                    elif self.check_type == '<=':
-                        metric_failed = not last_value <= float(self.value)
-                    elif self.check_type == '>':
-                        metric_failed = not last_value > float(self.value)
-                    elif self.check_type == '>=':
-                        metric_failed = not last_value >= float(self.value)
-                    elif self.check_type == '==':
-                        metric_failed = not last_value == float(self.value)
-                    else:
-                        raise Exception(u'Check type %s not supported' %
-                                        self.check_type)
-                    if metric_failed:
-                        metric_failure_value = last_value
-                    else:
-                        matched_metrics += 1
-                        logger.info("Metrics matched: " + str(matched_metrics))
-                        logger.info("Required metrics: " + str (self.expected_num_metrics))
-                else:
-                    failed = True
-                logger.info("Processing series ...")
-            if matched_metrics != self.expected_num_metrics:
-                failed = True
-            else:
-                failed = False
-
+        failures = []
+        graphite_output = parse_metric(self.metric, mins_to_check=self.frequency)
 
         try:
-            result.raw_data = json.dumps(series['raw'])
+            result.raw_data = json.dumps(graphite_output['raw'])
         except:
-            result.raw_data = series['raw']
-        result.succeeded = not failed
+            result.raw_data = graphite_output['raw']
+
+        if graphite_output["error"]:
+            result.succeeded = False
+            result.error = graphite_output["error"]
+            return result
+
+        if graphite_output['num_series_with_data'] > 0:
+            result.average_value = graphite_output['average_value']
+            for s in graphite_output['series']:
+                if not s["values"]:
+                    continue
+                failure_value = None
+                if self.check_type == '<':
+                    if float(s['min']) < float(self.value):
+                        failure_value = s['min']
+                elif self.check_type == '<=':
+                    if float(s['min']) <= float(self.value):
+                        failure_value = s['min']
+                elif self.check_type == '>':
+                    if float(s['max']) > float(self.value):
+                        failure_value = s['max']
+                elif self.check_type == '>=':
+                    if float(s['max']) >= float(self.value):
+                        failure_value = s['max']
+                elif self.check_type == '==':
+                    if float(self.value) in s['values']:
+                        failure_value = float(self.value)
+                else:
+                    raise Exception(u'Check type %s not supported' %
+                                    self.check_type)
+
+                if not failure_value is None:
+                    failures.append((s["target"], failure_value))
+
+        if len(failures) > self.allowed_num_failures:
+            result.succeeded = False
+        elif graphite_output['num_series_with_data'] < self.expected_num_hosts:
+            result.succeeded = False
+        else:
+            result.succeeded = True
+
         if not result.succeeded:
+            targets = [s["target"] for s in graphite_output["series"]]
+            hosts = minimize_targets(targets)
+            hosts_by_target = dict(zip(targets, hosts))
+
             result.error = self.format_error_message(
-                failure_value,
-                series['num_series_with_data'],
-                matched_metrics,
+                failures,
+                graphite_output['num_series_with_data'],
+                hosts_by_target,
             )
 
-        result.actual_hosts = series['num_series_with_data']
-        result.actual_metrics = matched_metrics
-        result.failure_value = failure_value
         return result
 
 
 class HttpStatusCheck(StatusCheck):
-
     class Meta(StatusCheck.Meta):
         proxy = True
 
@@ -691,23 +708,23 @@ class HttpStatusCheck(StatusCheck):
 
     def _run(self):
         result = StatusCheckResult(check=self)
-        auth = (self.username, self.password)
+
+        auth = None
+        if self.username or self.password:
+            auth = (self.username, self.password)
+
         try:
-            if self.username or self.password:
-                resp = requests.get(
-                    self.endpoint,
-                    timeout=self.timeout,
-                    verify=self.verify_ssl_certificate,
-                    auth=auth
-                )
-            else:
-                resp = requests.get(
-                    self.endpoint,
-                    timeout=self.timeout,
-                    verify=self.verify_ssl_certificate,
-                )
+            resp = requests.get(
+                self.endpoint,
+                timeout=self.timeout,
+                verify=self.verify_ssl_certificate,
+                auth=auth,
+                headers={
+                    "User-Agent": settings.HTTP_USER_AGENT,
+                },
+            )
         except requests.RequestException as e:
-            result.error = u'Request error occurred: %s' % (e,)
+            result.error = u'Request error occurred: %s' % (e.message,)
             result.succeeded = False
         else:
             if self.status_code and resp.status_code != int(self.status_code):
@@ -726,8 +743,8 @@ class HttpStatusCheck(StatusCheck):
                 result.succeeded = True
         return result
 
-class JenkinsStatusCheck(StatusCheck):
 
+class JenkinsStatusCheck(StatusCheck):
     class Meta(StatusCheck.Meta):
         proxy = True
 
@@ -756,7 +773,7 @@ class JenkinsStatusCheck(StatusCheck):
             # If something else goes wrong, we will *not* fail - otherwise
             # a lot of services seem to fail all at once.
             # Ugly to do it here but...
-            result.error = u'Error fetching from Jenkins - %s' % e
+            result.error = u'Error fetching from Jenkins - %s' % e.message
             result.succeeded = True
             return result
 
@@ -787,7 +804,6 @@ class JenkinsStatusCheck(StatusCheck):
 
 
 class StatusCheckResult(models.Model):
-
     """
     We use the same StatusCheckResult model for all check types,
     because really they are not so very different.
@@ -805,6 +821,10 @@ class StatusCheckResult(models.Model):
     # Jenkins specific
     job_number = models.PositiveIntegerField(null=True)
 
+    class Meta:
+        ordering = ['-time_complete']
+        index_together = (('check', 'time_complete'),)
+
     def __unicode__(self):
         return '%s: %s @%s' % (self.status, self.check.name, self.time)
 
@@ -817,8 +837,12 @@ class StatusCheckResult(models.Model):
 
     @property
     def took(self):
+        """
+        Time taken by check in ms
+        """
         try:
-            return (self.time_complete - self.time).microseconds / 1000
+            diff = self.time_complete - self.time
+            return (diff.microseconds + (diff.seconds + diff.days * 24 * 3600) * 10 ** 6) / 1000
         except:
             return None
 
@@ -834,6 +858,25 @@ class StatusCheckResult(models.Model):
         if isinstance(self.raw_data, basestring):
             self.raw_data = self.raw_data[:RAW_DATA_LIMIT]
         return super(StatusCheckResult, self).save(*args, **kwargs)
+
+
+class AlertAcknowledgement(models.Model):
+    time = models.DateTimeField()
+    user = models.ForeignKey(User)
+    service = models.ForeignKey(Service)
+    cancelled_time = models.DateTimeField(null=True, blank=True)
+    cancelled_user = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        related_name='cancelleduser_set'
+    )
+
+    def unexpired(self):
+        return self.expires() > timezone.now()
+
+    def expires(self):
+        return self.time + timedelta(minutes=settings.ACKNOWLEDGEMENT_EXPIRY)
 
 
 class UserProfile(models.Model):
@@ -861,6 +904,7 @@ class UserProfile(models.Model):
     mobile_number = models.CharField(max_length=20, blank=True, default='')
     hipchat_alias = models.CharField(max_length=50, blank=True, default='')
     fallback_alert_user = models.BooleanField(default=False)
+
 
 class Shift(models.Model):
     start = models.DateTimeField()

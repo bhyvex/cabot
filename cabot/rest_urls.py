@@ -1,4 +1,5 @@
 from django.db import models as model_fields
+from django.conf import settings
 from django.conf.urls import url, include
 from django.contrib.auth import models as django_models
 from polymorphic import PolymorphicModel
@@ -24,7 +25,7 @@ def create_viewset(arg_model, arg_fields, arg_read_only_fields=(), no_create=Fal
 
     viewset_class = None
     if no_create:
-        class NoCreateViewSet(mixins.RetrieveModelMixin, 
+        class NoCreateViewSet(mixins.RetrieveModelMixin,
                               mixins.UpdateModelMixin,
                               mixins.DestroyModelMixin,
                               mixins.ListModelMixin,
@@ -57,17 +58,19 @@ check_group_mixin_fields = (
 )
 
 router.register(r'services', create_viewset(
-    arg_model=models.Service, 
+    arg_model=models.Service,
     arg_fields=check_group_mixin_fields + (
         'url',
         'instances',
+        'overall_status',
     ),
 ))
 
 router.register(r'instances', create_viewset(
-    arg_model=models.Instance, 
+    arg_model=models.Instance,
     arg_fields=check_group_mixin_fields + (
         'address',
+        'overall_status',
     ),
 ))
 
@@ -77,32 +80,33 @@ status_check_fields = (
     'importance',
     'frequency',
     'debounce',
+    'calculated_status',
 )
 
 router.register(r'status_checks', create_viewset(
-    arg_model=models.StatusCheck, 
+    arg_model=models.StatusCheck,
     arg_fields=status_check_fields,
     no_create=True,
 ))
 
 router.register(r'icmp_checks', create_viewset(
-    arg_model=models.ICMPStatusCheck, 
+    arg_model=models.ICMPStatusCheck,
     arg_fields=status_check_fields,
 ))
 
 router.register(r'graphite_checks', create_viewset(
-    arg_model=models.GraphiteStatusCheck, 
+    arg_model=models.GraphiteStatusCheck,
     arg_fields=status_check_fields + (
         'metric',
         'check_type',
         'value',
         'expected_num_hosts',
-        'expected_num_metrics',
+        'allowed_num_failures',
     ),
 ))
 
 router.register(r'http_checks', create_viewset(
-    arg_model=models.HttpStatusCheck, 
+    arg_model=models.HttpStatusCheck,
     arg_fields=status_check_fields + (
         'endpoint',
         'username',
@@ -115,39 +119,36 @@ router.register(r'http_checks', create_viewset(
 ))
 
 router.register(r'jenkins_checks', create_viewset(
-    arg_model=models.JenkinsStatusCheck, 
+    arg_model=models.JenkinsStatusCheck,
     arg_fields=status_check_fields + (
         'max_queued_build_time',
     ),
 ))
 
-'''
-Omitting user API, could expose/allow modifying dangerous fields.
+# User API is off by default, could expose/allow modifying dangerous fields
+if settings.EXPOSE_USER_API:
+    router.register(r'users', create_viewset(
+        arg_model=django_models.User,
+        arg_fields=(
+            'password',
+            'is_active',
+            'groups',
+            #'user_permissions', # Doesn't work, removing for now
+            'username',
+            'first_name',
+            'last_name',
+            'email',
+        ),
+    ))
 
-router.register(r'users', create_viewset(
-    arg_model=django_models.User,
-    arg_fields=(
-        'password',
-        'is_active',
-        'groups',
-        #'user_permissions', # Doesn't work, removing for now
-        'username',
-        'first_name',
-        'last_name',
-        'email',
-    ),
-))
+    router.register(r'user_profiles', create_viewset(
+        arg_model=models.UserProfile,
+        arg_fields=(
+            'user',
+            'fallback_alert_user',
+        ),
+    ))
 
-router.register(r'user_profiles', create_viewset(
-    arg_model=models.UserProfile,
-    arg_fields=(
-        'user',
-        'mobile_number',
-        'hipchat_alias',
-        'fallback_alert_user',
-    ),
-))
-'''
 
 router.register(r'shifts', create_viewset(
     arg_model=models.Shift,
